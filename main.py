@@ -42,6 +42,14 @@ SEND_STARTUP_MESSAGE = os.getenv("SEND_STARTUP_MESSAGE", "True").lower() == "tru
 BYBIT_KLINE_URL = "https://api.bybit.com/v5/market/kline"
 BYBIT_TICKER_URL = "https://api.bybit.com/v5/market/tickers"
 
+# ------------------------------------------------------------
+# PROXY (Bybit bəzi bulud provayderlərin IP-lərini blok edir)
+# ------------------------------------------------------------
+# Format: http://istifadeci:sifre@proxy-host:port  (və ya http://proxy-host:port)
+# Boş saxlasan proxy istifadə olunmur (birbaşa qoşulur).
+BYBIT_PROXY_URL = os.getenv("BYBIT_PROXY_URL", "").strip()
+BYBIT_PROXIES = {"http": BYBIT_PROXY_URL, "https": BYBIT_PROXY_URL} if BYBIT_PROXY_URL else None
+
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 
 TRADE_TF = "15"
@@ -75,6 +83,47 @@ SCORE_GROUP_SYMBOLS = ["ETHUSDT", "SOLUSDT"]
 
 # 100 üzərindən minimum keçid balı - bundan aşağı olan siqnal (qrup daxilində) açılmır
 MIN_SIGNAL_SCORE = float(os.getenv("MIN_SIGNAL_SCORE", "50"))
+
+# ------------------------------------------------------------
+# SİQNAL FİLTRLƏRİ (hamısı ayrı-ayrı açılıb-bağlana bilər)
+# ------------------------------------------------------------
+# QEYD: Bu filtrlər yalnız breakout AŞKARLANANDA işə düşür (hər poll dövründə yox),
+# ona görə əsas candle_worker dövrəsini yavaşlatmır.
+
+# 1) Həcm təsdiqi: breakout şamının həcmi son 20 şamın ortalamasından
+#    ən azı bu əmsal qədər yüksək olmalıdır
+ENABLE_VOLUME_FILTER = os.getenv("ENABLE_VOLUME_FILTER", "True").lower() == "true"
+MIN_VOLUME_RATIO = float(os.getenv("MIN_VOLUME_RATIO", "1.5"))
+
+# 2) ADX filtri: trend gücü bu həddən aşağıdırsa (yastı bazar) siqnal rədd edilir
+ENABLE_ADX_FILTER = os.getenv("ENABLE_ADX_FILTER", "True").lower() == "true"
+MIN_ADX = float(os.getenv("MIN_ADX", "20"))
+
+# 3) Minimum volatilite filtri: ATR qiymətin bu faizindən (%) az olarsa (sıxılmış
+#    bazar) siqnal rədd edilir - whipsaw riskini azaldır
+ENABLE_ATR_FILTER = os.getenv("ENABLE_ATR_FILTER", "True").lower() == "true"
+MIN_ATR_PCT = float(os.getenv("MIN_ATR_PCT", "0.15"))  # məs: 0.15% = qiymətin 0.0015-i
+
+# 4) Multi-timeframe təsdiqi: breakout həm TRADE_TF, həm də TREND_TF-də
+#    (daha az dövrlə) təsdiqlənməlidir
+ENABLE_MTF_FILTER = os.getenv("ENABLE_MTF_FILTER", "True").lower() == "true"
+TREND_DONCHIAN_PERIOD = int(os.getenv("TREND_DONCHIAN_PERIOD", "10"))
+
+# 5) Spread/likidlik filtri: siqnal anında bid-ask spread bu faizdən genişdirsə
+#    (aşağı likidlik) siqnal rədd edilir. Yalnız breakout aşkarlananda 1 əlavə
+#    API sorğusu edir - pollinq dövrəsini yavaşlatmır.
+ENABLE_SPREAD_FILTER = os.getenv("ENABLE_SPREAD_FILTER", "True").lower() == "true"
+MAX_SPREAD_PCT = float(os.getenv("MAX_SPREAD_PCT", "0.15"))
+
+# 6) Correlation/exposure limiti: eyni istiqamətdə (LONG və ya SHORT) maksimum
+#    neçə aktiv trade ola bilər (BTC, ETH, SOL çox vaxt birgə hərəkət edir)
+MAX_SAME_DIRECTION_TRADES = int(os.getenv("MAX_SAME_DIRECTION_TRADES", "2"))
+
+# 7) Partial take-profit: 1R (risk vahidi) qazanılanda pozisiyanın yarısı
+#    "bağlanır" (bildiriş göndərilir), qalanı trailing stop ilə davam edir
+ENABLE_PARTIAL_TP = os.getenv("ENABLE_PARTIAL_TP", "True").lower() == "true"
+PARTIAL_TP_R_MULTIPLE = float(os.getenv("PARTIAL_TP_R_MULTIPLE", "1.0"))
+PARTIAL_TP_CLOSE_PCT = float(os.getenv("PARTIAL_TP_CLOSE_PCT", "0.5"))
 
 DB_FILE = "trend_breakout.db"
 PID_FILE = "trend_bot.lock"
@@ -387,7 +436,7 @@ def telegram_polling_worker():
 def fetch_klines(symbol, interval, limit=MAX_CANDLES):
     params = {"category": "linear", "symbol": symbol, "interval": interval, "limit": limit}
     try:
-        r = requests.get(BYBIT_KLINE_URL, params=params, timeout=15)
+        r = requests.get(BYBIT_KLINE_URL, params=params, timeout=15, proxies=BYBIT_PROXIES)
         data = r.json()
         if data.get("retCode") != 0:
             print(f"❌ Bybit kline xətası {symbol}:", data)
@@ -413,7 +462,7 @@ def fetch_klines(symbol, interval, limit=MAX_CANDLES):
 def fetch_price(symbol):
     params = {"category": "linear", "symbol": symbol}
     try:
-        r = requests.get(BYBIT_TICKER_URL, params=params, timeout=10)
+        r = requests.get(BYBIT_TICKER_URL, params=params, timeout=10, proxies=BYBIT_PROXIES)
         data = r.json()
         if data.get("retCode") != 0:
             _note_fetch_failure(symbol)
@@ -427,6 +476,31 @@ def fetch_price(symbol):
     except Exception as e:
         print(f"❌ {symbol} qiymət sorğu xətası:", e)
         _note_fetch_failure(symbol)
+        return None
+
+
+def fetch_spread_pct(symbol):
+    """
+    Bid-ask spread-i faiz kimi qaytarır. Yalnız breakout aşkarlananda çağırılır,
+    ona görə əsas poll dövrəsinə əlavə yük gətirmir.
+    """
+    params = {"category": "linear", "symbol": symbol}
+    try:
+        r = requests.get(BYBIT_TICKER_URL, params=params, timeout=10, proxies=BYBIT_PROXIES)
+        data = r.json()
+        if data.get("retCode") != 0:
+            return None
+        lst = data["result"]["list"]
+        if not lst:
+            return None
+        bid = float(lst[0].get("bid1Price", 0) or 0)
+        ask = float(lst[0].get("ask1Price", 0) or 0)
+        if bid <= 0 or ask <= 0:
+            return None
+        mid = (bid + ask) / 2
+        return ((ask - bid) / mid) * 100
+    except Exception as e:
+        print(f"⚠️ {symbol} spread sorğu xətası:", e)
         return None
 
 
@@ -670,6 +744,15 @@ def check_for_signal(symbol):
     breakout_long = closed_trade_candle["close"] > donchian_high
     breakout_short = closed_trade_candle["close"] < donchian_low
 
+    if not (breakout_long or breakout_short):
+        return None
+
+    side = "LONG" if breakout_long else "SHORT"
+    if side == "LONG" and not bullish_regime:
+        return None
+    if side == "SHORT" and not bearish_regime:
+        return None
+
     # Bal hesablamaq üçün: ADX (trend gücü) və orta həcm (son 20 bağlanmış şam,
     # breakout şamı XARİC olmaqla - repaint riski olmasın deyə)
     adx_value = calc_adx(trade_data[:-1], ATR_PERIOD)
@@ -677,37 +760,66 @@ def check_for_signal(symbol):
     avg_volume = (sum(c["volume"] for c in volume_window) / len(volume_window)) if volume_window else None
     breakout_volume = closed_trade_candle["volume"]
 
-    if bullish_regime and breakout_long:
-        entry = closed_trade_candle["close"]
+    # --- FİLTR 1: Həcm təsdiqi ---
+    if ENABLE_VOLUME_FILTER and avg_volume:
+        volume_ratio = breakout_volume / avg_volume if avg_volume else 0
+        if volume_ratio < MIN_VOLUME_RATIO:
+            print(f"⏸️ {symbol} siqnalı rədd edildi: həcm zəif ({volume_ratio:.2f}x < {MIN_VOLUME_RATIO}x)")
+            return None
+
+    # --- FİLTR 2: ADX (trend gücü) ---
+    if ENABLE_ADX_FILTER and adx_value is not None:
+        if adx_value < MIN_ADX:
+            print(f"⏸️ {symbol} siqnalı rədd edildi: ADX zəif ({adx_value:.1f} < {MIN_ADX})")
+            return None
+
+    # --- FİLTR 3: Minimum ATR (volatilite) ---
+    if ENABLE_ATR_FILTER:
+        atr_pct = (current_atr / closed_trade_candle["close"]) * 100
+        if atr_pct < MIN_ATR_PCT:
+            print(f"⏸️ {symbol} siqnalı rədd edildi: ATR çox aşağıdır ({atr_pct:.3f}% < {MIN_ATR_PCT}%)")
+            return None
+
+    # --- FİLTR 4: Multi-timeframe təsdiqi (TREND_TF üzərində daha geniş Donchian) ---
+    if ENABLE_MTF_FILTER:
+        trend_donchian_high, trend_donchian_low = donchian_channel(
+            trend_data[:-1], TREND_DONCHIAN_PERIOD, exclude_last=1
+        )
+        # Kifayət qədər trend-tf data yoxdursa filtri keçirik (bloklamırıq)
+        if trend_donchian_high is not None:
+            if side == "LONG" and closed_trend_candle["close"] <= trend_donchian_high:
+                print(f"⏸️ {symbol} siqnalı rədd edildi: {TREND_TF}dəq trend-də breakout təsdiqlənmədi (LONG)")
+                return None
+            if side == "SHORT" and closed_trend_candle["close"] >= trend_donchian_low:
+                print(f"⏸️ {symbol} siqnalı rədd edildi: {TREND_TF}dəq trend-də breakout təsdiqlənmədi (SHORT)")
+                return None
+
+    # --- FİLTR 5: Spread/likidlik (yalnız breakout təsdiqləndikdən sonra, 1 əlavə sorğu) ---
+    if ENABLE_SPREAD_FILTER:
+        spread_pct = fetch_spread_pct(symbol)
+        if spread_pct is not None and spread_pct > MAX_SPREAD_PCT:
+            print(f"⏸️ {symbol} siqnalı rədd edildi: spread çox geniş ({spread_pct:.3f}% > {MAX_SPREAD_PCT}%)")
+            return None
+
+    entry = closed_trade_candle["close"]
+    if side == "LONG":
         initial_stop = entry - current_atr * CHANDELIER_ATR_MULT
         if initial_stop >= entry:
             return None
-        score, breakdown = calculate_signal_score(
-            "LONG", entry, donchian_high, donchian_low, current_atr,
-            adx_value, breakout_volume, avg_volume
-        )
-        return {
-            "symbol": symbol, "side": "LONG", "entry": entry,
-            "initial_stop": initial_stop, "candle_time": closed_trade_candle["time"],
-            "atr": current_atr, "score": score, "score_breakdown": breakdown,
-        }
-
-    if bearish_regime and breakout_short:
-        entry = closed_trade_candle["close"]
+    else:
         initial_stop = entry + current_atr * CHANDELIER_ATR_MULT
         if initial_stop <= entry:
             return None
-        score, breakdown = calculate_signal_score(
-            "SHORT", entry, donchian_high, donchian_low, current_atr,
-            adx_value, breakout_volume, avg_volume
-        )
-        return {
-            "symbol": symbol, "side": "SHORT", "entry": entry,
-            "initial_stop": initial_stop, "candle_time": closed_trade_candle["time"],
-            "atr": current_atr, "score": score, "score_breakdown": breakdown,
-        }
 
-    return None
+    score, breakdown = calculate_signal_score(
+        side, entry, donchian_high, donchian_low, current_atr,
+        adx_value, breakout_volume, avg_volume
+    )
+    return {
+        "symbol": symbol, "side": side, "entry": entry,
+        "initial_stop": initial_stop, "candle_time": closed_trade_candle["time"],
+        "atr": current_atr, "score": score, "score_breakdown": breakdown,
+    }
 
 
 def open_trade(signal):
@@ -725,6 +837,17 @@ def open_trade(signal):
             print(f"⏸️ {symbol} siqnalı rədd edildi: {reason}")
             return
 
+        # --- Correlation/exposure limiti: eyni istiqamətdə çox trade açılmasın ---
+        same_direction_count = sum(
+            1 for t in active_trades.values() if t["side"] == signal["side"]
+        )
+        if same_direction_count >= MAX_SAME_DIRECTION_TRADES:
+            print(
+                f"⏸️ {symbol} siqnalı rədd edildi: {signal['side']} istiqamətində "
+                f"artıq {same_direction_count} aktiv trade var (limit: {MAX_SAME_DIRECTION_TRADES})"
+            )
+            return
+
         last_signal_candle[symbol] = signal["candle_time"]
         position_size = calc_position_size(signal["entry"], signal["initial_stop"])
 
@@ -739,6 +862,8 @@ def open_trade(signal):
             "status": "ACTIVE",
             "position_size_usdt": position_size,
             "created_at": time.time(),
+            "r_value": abs(signal["entry"] - signal["initial_stop"]),
+            "partial_taken": False,
         }
         active_trades[symbol] = trade
         register_trade_opened()
@@ -787,11 +912,26 @@ def update_trailing_stops(symbol, price):
     """
     trade_snapshot = None
     should_alert_cooldown = False
+    partial_tp_hit = None  # trade snapshot at the moment partial TP fires (for telegram, outside lock)
 
     with lock:
         trade = active_trades.get(symbol)
         if not trade:
             return
+
+        # --- Partial take-profit: 1R qazanılanda "yarısı bağlanır" (bildiriş) ---
+        if ENABLE_PARTIAL_TP and not trade.get("partial_taken", False) and trade.get("r_value", 0) > 0:
+            r_value = trade["r_value"]
+            if trade["side"] == "LONG":
+                target = trade["entry"] + r_value * PARTIAL_TP_R_MULTIPLE
+                hit = price >= target
+            else:
+                target = trade["entry"] - r_value * PARTIAL_TP_R_MULTIPLE
+                hit = price <= target
+            if hit:
+                trade["partial_taken"] = True
+                trade["partial_exit_price"] = price
+                partial_tp_hit = dict(trade)
 
         result = None
 
@@ -813,17 +953,32 @@ def update_trailing_stops(symbol, price):
                 result = "WIN" if trade["trailing_stop"] < trade["entry"] else "LOSS"
 
         if result is None:
-            return
+            if partial_tp_hit is None:
+                return
+        else:
+            trade["status"] = result
+            trade["exit_price"] = price
+            trade["closed_at"] = time.time()
 
-        trade["status"] = result
-        trade["exit_price"] = price
-        trade["closed_at"] = time.time()
+            active_trades.pop(symbol, None)
+            should_alert_cooldown = register_trade_result(result)
 
-        active_trades.pop(symbol, None)
-        should_alert_cooldown = register_trade_result(result)
+            # Telegram/DB üçün lock xaricinə çıxaracağımız dəyişməz snapshot
+            trade_snapshot = dict(trade)
 
-        # Telegram/DB üçün lock xaricinə çıxaracağımız dəyişməz snapshot
-        trade_snapshot = dict(trade)
+    # --- Partial TP bildirişi (lock xaricində göndərilir) ---
+    if partial_tp_hit is not None:
+        pct = int(PARTIAL_TP_CLOSE_PCT * 100)
+        send_telegram(
+            f"💰 PARTIAL TAKE-PROFIT — {symbol} {partial_tp_hit['side']}\n\n"
+            f"1R hədəfinə çatıldı, pozisiyanın ~{pct}%-i bağlandı (konseptual).\n"
+            f"Entry: {partial_tp_hit['entry']:.4f}\n"
+            f"Partial Exit: {price:.4f}\n"
+            f"Qalan {100-pct}% trailing stop ilə davam edir."
+        )
+
+    if trade_snapshot is None:
+        return
 
     # Bundan sonrakı hər şey lock XARİCİNDƏ - şəbəkə/DB çağırışları lock-u
     # gərək saxlamasın, əks halda digər thread-lər bloklanar
