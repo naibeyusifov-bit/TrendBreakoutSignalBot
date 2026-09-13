@@ -1,21 +1,14 @@
 """
-TREND BREAKOUT BOT
-===================
-SMC/liquidity-sweep əvəzinə obyektiv, backtest edilə bilən qaydalar:
-
-  - TREND FILTRİ : yüksək timeframe-də (default 1h) EMA200-ə görə istiqamət
-  - GİRİŞ        : Donchian Channel breakout (son N bağlanmış şamın ən
-                   yüksək/aşağı səviyyəsinin qırılması)
-  - ÇIXIŞ        : Chandelier Exit — ATR-based trailing stop.
-  - RİSK         : Fixed-fractional pozisiya ölçüsü, günlük trade limiti,
-                   ardıcıl itkidən sonra soyuma (cooldown)
-
-TELEGRAM İNTEQRASİYASI:
-  - Avtomatik siqnal və bildirişlər
-  - Webhook vasitəsilə cavab verən komandalar (/status, /stats, /active, /help)
+TREND BREAKOUT BOT (OPTIMIZED & TELEGRAM READY)
+===============================================
+- TELEGRAM INTEGRATION: Həm Long Polling (getUpdates), həm də Webhook dəstəyi.
+- NO REPAINT           : İndikatorlar və breakout tam bağlanmış şamlar (-2) üzrə.
+- THREAD-SAFE          : Lock-lar ilə yaddaş və SQLite toqquşmasının qarşısı alınıb.
+- TEST READY           : Günlük trade limiti test üçün limitsizdir (99999).
 """
 
 import os
+import sys
 import time
 import sqlite3
 import threading
@@ -26,11 +19,14 @@ from flask import Flask, jsonify, request
 
 
 # ============================================================
-# CONFIG
+# CONFIG (MƏLUMATLARINIZI BURAYA ƏLAVƏ EDİN)
 # ============================================================
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID_HERE")
+
+# Long Polling rejimini aktiv saxlayın (Webhook qurmağa ehtiyac qalmır)
+USE_POLLING = os.getenv("USE_POLLING", "True").lower() == "true"
 
 BYBIT_KLINE_URL = "https://api.bybit.com/v5/market/kline"
 BYBIT_TICKER_URL = "https://api.bybit.com/v5/market/tickers"
@@ -51,11 +47,13 @@ PRICE_POLL_SECONDS = 10
 
 ACCOUNT_BALANCE_USDT = float(os.getenv("ACCOUNT_BALANCE_USDT", "1000"))
 RISK_PER_TRADE_PCT = 0.01
-MAX_TRADES_PER_DAY = 3
+
+MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "99999"))
 MAX_CONSECUTIVE_LOSSES = 3
 COOLDOWN_HOURS_AFTER_LOSSES = 24
 
 DB_FILE = "trend_breakout.db"
+PID_FILE = "trend_bot.lock"
 
 
 # ============================================================
@@ -66,10 +64,11 @@ app = Flask(__name__)
 
 
 # ============================================================
-# GLOBAL STATE
+# GLOBAL STATE & LOCKS
 # ============================================================
 
 lock = threading.Lock()
+db_lock = threading.Lock()
 
 candles_trade_tf = {s: [] for s in SYMBOLS}
 candles_trend_tf = {s: [] for s in SYMBOLS}
@@ -88,91 +87,247 @@ _startup_lock = threading.Lock()
 
 
 # ============================================================
-# DATABASE
+# SINGLE INSTANCE GUARD (PID LOCK)
+# ============================================================
+
+def check_single_instance():
+    """Botun dublikat işə düşməsinin qarşısını alır."""
+    pid = str(os.getpid())
+    if os.path.exists(PID_FILE):
+        try:
+            with open(PID_FILE, "r") as f:
+                old_pid = int(f.read().strip())
+            if old_pid != os.getpid():
+                try:
+                    os.kill(old_pid, 0)
+                    print(f"⚠️ [PID Lock] Bot artıq başqa prosesdə işləyir (PID: {old_pid}). Təkrarlanma dayandırıldı.")
+                    return False
+                except (OSError, ProcessLookupError):
+                    pass
+        except (OSError, ValueError):
+            pass
+
+    try:
+        with open(PID_FILE, "w") as f:
+            f.write(pid)
+        return True
+    except Exception as e:
+        print(f"❌ PID lock faylı xətası: {e}")
+        return True
+
+
+# ============================================================
+# DATABASE (THREAD-SAFE)
 # ============================================================
 
 def init_db():
-    conn = sqlite3.connect(DB_FILE, timeout=10)
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS trades (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            symbol TEXT NOT NULL,
-            side TEXT NOT NULL,
-            entry REAL NOT NULL,
-            initial_stop REAL NOT NULL,
-            exit_price REAL,
-            status TEXT NOT NULL,
-            position_size_usdt REAL,
-            created_at REAL NOT NULL,
-            closed_at REAL
-        )
-    """)
-    conn.commit()
-    conn.close()
+    with db_lock:
+        conn = sqlite3.connect(DB_FILE, timeout=15)
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                entry REAL NOT NULL,
+                initial_stop REAL NOT NULL,
+                exit_price REAL,
+                status TEXT NOT NULL,
+                position_size_usdt REAL,
+                created_at REAL NOT NULL,
+                closed_at REAL
+            )
+        """)
+        conn.commit()
+        conn.close()
 
 
 def save_trade(trade):
     try:
-        conn = sqlite3.connect(DB_FILE, timeout=10)
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO trades
-            (symbol, side, entry, initial_stop, exit_price, status,
-             position_size_usdt, created_at, closed_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            trade["symbol"], trade["side"], trade["entry"],
-            trade["initial_stop"], trade.get("exit_price"),
-            trade["status"], trade.get("position_size_usdt"),
-            trade["created_at"], trade.get("closed_at"),
-        ))
-        conn.commit()
-        conn.close()
+        with db_lock:
+            conn = sqlite3.connect(DB_FILE, timeout=15)
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO trades
+                (symbol, side, entry, initial_stop, exit_price, status,
+                 position_size_usdt, created_at, closed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                trade["symbol"], trade["side"], trade["entry"],
+                trade["initial_stop"], trade.get("exit_price"),
+                trade["status"], trade.get("position_size_usdt"),
+                trade["created_at"], trade.get("closed_at"),
+            ))
+            conn.commit()
+            conn.close()
     except Exception as e:
         print("❌ save_trade xətası:", e)
 
 
 def get_statistics():
-    init_db()
-    conn = sqlite3.connect(DB_FILE, timeout=10)
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT COUNT(*),
-               COALESCE(SUM(CASE WHEN status='WIN' THEN 1 ELSE 0 END), 0),
-               COALESCE(SUM(CASE WHEN status='LOSS' THEN 1 ELSE 0 END), 0)
-        FROM trades
-    """)
-    total, wins, losses = cur.fetchone()
-    conn.close()
-    win_rate = round((wins / total) * 100, 2) if total else 0
-    return {"total": total, "wins": wins, "losses": losses, "win_rate": win_rate}
+    try:
+        with db_lock:
+            conn = sqlite3.connect(DB_FILE, timeout=15)
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT COUNT(*),
+                       COALESCE(SUM(CASE WHEN status='WIN' THEN 1 ELSE 0 END), 0),
+                       COALESCE(SUM(CASE WHEN status='LOSS' THEN 1 ELSE 0 END), 0)
+                FROM trades
+            """)
+            total, wins, losses = cur.fetchone()
+            conn.close()
+        win_rate = round((wins / total) * 100, 2) if total else 0
+        return {"total": total, "wins": wins, "losses": losses, "win_rate": win_rate}
+    except Exception as e:
+        print("❌ get_statistics xətası:", e)
+        return {"total": 0, "wins": 0, "losses": 0, "win_rate": 0}
 
 
 init_db()
 
 
 # ============================================================
-# TELEGRAM
+# TELEGRAM ENGINE (DISPATCH & POLLING)
 # ============================================================
 
-def send_telegram(message, parse_mode=None):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("❌ Telegram token/chat_id yoxdur.")
+def send_telegram(message, chat_id=None, parse_mode=None):
+    token = TELEGRAM_BOT_TOKEN
+    target_chat_id = chat_id or TELEGRAM_CHAT_ID
+
+    if not token or token == "YOUR_BOT_TOKEN_HERE" or not target_chat_id:
+        print("❌ Telegram token və ya chat_id təyin edilməyib.")
         return False
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
+
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {"chat_id": target_chat_id, "text": message}
     if parse_mode:
         payload["parse_mode"] = parse_mode
+
     try:
         r = requests.post(url, json=payload, timeout=10)
-        ok = r.json().get("ok")
-        if not ok:
-            print("❌ Telegram xətası:", r.json())
-        return ok
+        res = r.json()
+        if not res.get("ok"):
+            # Əgər Markdown format xətası verərsə, adi mətn kimi yenidən cəhd et
+            if parse_mode:
+                payload.pop("parse_mode", None)
+                r = requests.post(url, json=payload, timeout=10)
+                return r.json().get("ok", False)
+            print("❌ Telegram xətası:", res)
+            return False
+        return True
     except Exception as e:
         print("❌ Telegram bağlantı xətası:", e)
         return False
+
+
+def process_telegram_update(update_data):
+    """Gələn Telegram mesajlarını emal edir və cavablandırır."""
+    if not update_data or "message" not in update_data:
+        return
+
+    msg = update_data["message"]
+    chat_id = msg.get("chat", {}).get("id")
+    raw_text = msg.get("text", "").strip()
+
+    if not chat_id or not raw_text:
+        return
+
+    # Bot istifadəçi adını temizləyirik (/status@BotName -> /status)
+    cmd = raw_text.split("@")[0].strip().lower()
+
+    response_text = ""
+
+    if cmd in ["/start", "/help", "komek", "kömək", "yardim", "yardım"]:
+        response_text = (
+            "🤖 *TREND BREAKOUT BOT ƏMRLƏRİ*\n\n"
+            "📊 /stats - Ümumi WIN/LOSS və Win Rate\n"
+            "⚡ /active - Açıq olan pozisiyalar\n"
+            "🟢 /status - Botun vəziyyəti və günlük limitlər\n"
+            "❓ /help - Bu menyu"
+        )
+
+    elif cmd in ["/status", "status"]:
+        with lock:
+            active_count = len(active_trades)
+            reset_daily_counter_if_needed()
+            current_daily = daily_trade_count
+
+        cooldown_str = "Aktiv deyil"
+        if cooldown_until:
+            cooldown_str = cooldown_until.strftime("%d.%m.%Y %H:%M UTC")
+
+        limit_str = "Limitsiz (Test)" if MAX_TRADES_PER_DAY >= 9999 else str(MAX_TRADES_PER_DAY)
+
+        response_text = (
+            "🤖 *BOT VƏZİYYƏTİ*\n\n"
+            "🟢 Status: ONLINE\n"
+            f"📈 Açıq Trade Sayı: {active_count}\n"
+            f"📅 Bugünkü Trade Sayı: {current_daily}/{limit_str}\n"
+            f"❄️ Cooldown: {cooldown_str}"
+        )
+
+    elif cmd in ["/stats", "stats", "statistika"]:
+        stats = get_statistics()
+        response_text = (
+            "📊 *ÜMUMİ STATİSTİKA*\n\n"
+            f"Cəmi Trade: {stats['total']}\n"
+            f"✅ WIN: {stats['wins']}\n"
+            f"❌ LOSS: {stats['losses']}\n"
+            f"🎯 Win Rate: %{stats['win_rate']}"
+        )
+
+    elif cmd in ["/active", "active", "aciq"]:
+        with lock:
+            trades_list = list(active_trades.values())
+
+        if not trades_list:
+            response_text = "ℹ️ Hal-hazırda aktiv trade yoxdur."
+        else:
+            response_text = "⚡ *AÇIQ TRADELƏR*\n\n"
+            for t in trades_list:
+                emoji = "🟢" if t["side"] == "LONG" else "🔴"
+                response_text += (
+                    f"{emoji} *{t['symbol']} {t['side']}*\n"
+                    f"Entry: `{t['entry']:.4f}`\n"
+                    f"Trailing Stop: `{t['trailing_stop']:.4f}`\n"
+                    f"Həcm: ~`{t['position_size_usdt']:.2f}` USDT\n\n"
+                )
+
+    if response_text:
+        send_telegram(response_text, chat_id=chat_id, parse_mode="Markdown")
+
+
+def telegram_polling_worker():
+    """Webhook olmadan Telegram əmrlərini canlı dinləmək üçün Polling servisi."""
+    if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
+        print("⚠️ TELEGRAM_BOT_TOKEN təyin edilmədiyi üçün Polling işə düşmədi.")
+        return
+
+    print("🤖 Telegram Long Polling başladıldı...")
+
+    # Köhnə Webhook-u silirik ki, Polling rejimində toqquşma olmasın
+    try:
+        requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook", timeout=10)
+    except Exception as e:
+        print("⚠️ deleteWebhook xətası:", e)
+
+    offset = 0
+    while True:
+        try:
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+            params = {"offset": offset, "timeout": 20}
+            resp = requests.get(url, params=params, timeout=25)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("ok"):
+                    for update in data.get("result", []):
+                        offset = update["update_id"] + 1
+                        process_telegram_update(update)
+        except Exception as e:
+            print("❌ Telegram Polling xətası:", e)
+            time.sleep(5)
+        time.sleep(1)
 
 
 # ============================================================
@@ -284,8 +439,8 @@ def register_trade_result(result):
     if result == "LOSS":
         consecutive_losses += 1
         if consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
-            cooldown_until = datetime.now(timezone.utc).timestamp() + COOLDOWN_HOURS_AFTER_LOSSES * 3600
-            cooldown_until = datetime.fromtimestamp(cooldown_until, tz=timezone.utc)
+            cooldown_until_ts = datetime.now(timezone.utc).timestamp() + COOLDOWN_HOURS_AFTER_LOSSES * 3600
+            cooldown_until = datetime.fromtimestamp(cooldown_until_ts, tz=timezone.utc)
             send_telegram(
                 f"⏸️ {MAX_CONSECUTIVE_LOSSES} ardıcıl itkidən sonra bot "
                 f"{COOLDOWN_HOURS_AFTER_LOSSES} saat dayandırılır."
@@ -305,7 +460,7 @@ def calc_position_size(entry, stop):
 
 
 # ============================================================
-# SİQNAL MƏNTİQİ
+# SİQNAL MƏNTİQİ (NO REPAINT - BAĞLANMIŞ ŞAMLAR)
 # ============================================================
 
 def check_for_signal(symbol):
@@ -313,50 +468,52 @@ def check_for_signal(symbol):
         trade_data = list(candles_trade_tf[symbol])
         trend_data = list(candles_trend_tf[symbol])
 
-    if len(trade_data) < DONCHIAN_PERIOD + 5 or len(trend_data) < EMA_TREND_PERIOD + 5:
+    if len(trade_data) < DONCHIAN_PERIOD + 10 or len(trend_data) < EMA_TREND_PERIOD + 10:
         return None
 
-    current = trade_data[-1]
+    # Bağlanmış şam (-2)
+    closed_trade_candle = trade_data[-2]
+    closed_trend_candle = trend_data[-2]
 
-    trend_closes = [c["close"] for c in trend_data]
+    trend_closes = [c["close"] for c in trend_data[:-1]]
     trend_ema = ema(trend_closes[-(EMA_TREND_PERIOD + 50):], EMA_TREND_PERIOD)
     if trend_ema is None:
         return None
 
-    trend_price = trend_data[-1]["close"]
+    trend_price = closed_trend_candle["close"]
     bullish_regime = trend_price > trend_ema
     bearish_regime = trend_price < trend_ema
 
-    donchian_high, donchian_low = donchian_channel(trade_data, DONCHIAN_PERIOD)
+    donchian_high, donchian_low = donchian_channel(trade_data[:-1], DONCHIAN_PERIOD, exclude_last=1)
     if donchian_high is None:
         return None
 
-    current_atr = atr(trade_data)
+    current_atr = atr(trade_data[:-1], ATR_PERIOD)
     if current_atr is None or current_atr <= 0:
         return None
 
-    breakout_long = current["close"] > donchian_high
-    breakout_short = current["close"] < donchian_low
+    breakout_long = closed_trade_candle["close"] > donchian_high
+    breakout_short = closed_trade_candle["close"] < donchian_low
 
     if bullish_regime and breakout_long:
-        entry = current["close"]
+        entry = closed_trade_candle["close"]
         initial_stop = entry - current_atr * CHANDELIER_ATR_MULT
         if initial_stop >= entry:
             return None
         return {
             "symbol": symbol, "side": "LONG", "entry": entry,
-            "initial_stop": initial_stop, "candle_time": current["time"],
+            "initial_stop": initial_stop, "candle_time": closed_trade_candle["time"],
             "atr": current_atr,
         }
 
     if bearish_regime and breakout_short:
-        entry = current["close"]
+        entry = closed_trade_candle["close"]
         initial_stop = entry + current_atr * CHANDELIER_ATR_MULT
         if initial_stop <= entry:
             return None
         return {
             "symbol": symbol, "side": "SHORT", "entry": entry,
-            "initial_stop": initial_stop, "candle_time": current["time"],
+            "initial_stop": initial_stop, "candle_time": closed_trade_candle["time"],
             "atr": current_atr,
         }
 
@@ -396,19 +553,20 @@ def open_trade(signal):
         register_trade_opened()
 
     emoji = "🟢" if trade["side"] == "LONG" else "🔴"
+    limit_str = "Limitsiz (Test)" if MAX_TRADES_PER_DAY >= 9999 else str(MAX_TRADES_PER_DAY)
     message = f"""
-🚨 TREND BREAKOUT SİQNALI
+🚨 TREND BREAKOUT SİQNALI (TEST REJİMİ)
 
 {emoji} {symbol} {trade["side"]}
 
 Entry: {trade["entry"]:.4f}
-İlkin Stop (trailing başlanğıc): {trade["initial_stop"]:.4f}
+İlkin Stop: {trade["initial_stop"]:.4f}
 Tövsiyə olunan pozisiya: ~{trade["position_size_usdt"]:.2f} USDT
-(balansın {RISK_PER_TRADE_PCT*100:.0f}%-i risk əsasında)
 
 Səbəb: Donchian({DONCHIAN_PERIOD}) breakout + EMA{EMA_TREND_PERIOD}({TREND_TF}dəq) trend
 
-⏳ Status: ACTIVE — stop qiymətin xeyrinə hərəkət edəcək (trailing)
+⏳ Status: ACTIVE — Trailing Stop Aktivdir
+📅 Günlük Trade Sayı: {daily_trade_count}/{limit_str}
 """
     print(message)
     send_telegram(message)
@@ -417,8 +575,8 @@ Səbəb: Donchian({DONCHIAN_PERIOD}) breakout + EMA{EMA_TREND_PERIOD}({TREND_TF}
 def update_trailing_stops(symbol, price):
     with lock:
         trade = active_trades.get(symbol)
-    if not trade:
-        return
+        if not trade:
+            return
 
     result = None
 
@@ -448,9 +606,9 @@ def update_trailing_stops(symbol, price):
 
     with lock:
         active_trades.pop(symbol, None)
+        register_trade_result(result)
 
     save_trade(trade)
-    register_trade_result(result)
 
     emoji = "✅" if result == "WIN" else "❌"
     message = f"""
@@ -492,9 +650,9 @@ def candle_worker():
                     candles_trend_tf[symbol] = trend_candles[-MAX_CANDLES:]
 
             if trade_candles:
-                newest = trade_candles[-1]
-                if newest["time"] != last_seen_time[symbol]:
-                    last_seen_time[symbol] = newest["time"]
+                closed_time = trade_candles[-2]["time"] if len(trade_candles) >= 2 else None
+                if closed_time and closed_time != last_seen_time[symbol]:
+                    last_seen_time[symbol] = closed_time
                     signal = check_for_signal(symbol)
                     if signal:
                         open_trade(signal)
@@ -526,6 +684,8 @@ def startup():
     with _startup_lock:
         if _startup_done:
             return
+        if not check_single_instance():
+            return
         _startup_done = True
 
     print("🚀 TREND BREAKOUT BOT BAŞLAYIR...")
@@ -533,13 +693,15 @@ def startup():
     threading.Thread(target=candle_worker, daemon=True).start()
     threading.Thread(target=price_worker, daemon=True).start()
 
+    if USE_POLLING:
+        threading.Thread(target=telegram_polling_worker, daemon=True).start()
+
+    limit_str = "Limitsiz (Test)" if MAX_TRADES_PER_DAY >= 9999 else str(MAX_TRADES_PER_DAY)
     send_telegram(
         "🚀 TREND BREAKOUT BOT AKTİVDİR!\n\n"
         f"📡 {', '.join(SYMBOLS)} izlənilir.\n"
-        f"📊 Donchian({DONCHIAN_PERIOD}) + EMA{EMA_TREND_PERIOD}({TREND_TF}dəq) + "
-        f"Chandelier Exit trailing stop\n"
-        f"⚖️ Risk: trade başına balansın {RISK_PER_TRADE_PCT*100:.0f}%-i, "
-        f"günlük max {MAX_TRADES_PER_DAY} trade\n"
+        f"📊 Donchian({DONCHIAN_PERIOD}) + EMA{EMA_TREND_PERIOD}({TREND_TF}dəq) + Chandelier Exit\n"
+        f"⚖️ Günlük Max Trade: {limit_str}\n"
         "💾 Nəticələr SQLite-də saxlanılır.\n\n"
         "💬 Bot əmrləri üçün Telegram-da /help yazın."
     )
@@ -584,86 +746,9 @@ def active_route():
 
 @app.route("/telegram-webhook", methods=["POST"])
 def telegram_webhook():
-    """Telegram-dan gələn mesajları dinləyən və cavablandıran yer."""
     data = request.get_json()
-    if not data or "message" not in data:
-        return jsonify({"status": "ignored"}), 200
-
-    message = data["message"]
-    chat_id = message.get("chat", {}).get("id")
-    text = message.get("text", "").strip().lower()
-
-    if not chat_id:
-        return jsonify({"status": "no chat_id"}), 200
-
-    response_text = ""
-
-    if text in ["/start", "/help", "komek", "kömək", "yardim", "yardım"]:
-        response_text = (
-            "🤖 *TREND BREAKOUT BOT ƏMRLƏRİ*\n\n"
-            "📊 /stats - Ümumi WIN/LOSS və Win Rate\n"
-            "⚡ /active - Açıq olan pozisiyalar\n"
-            "🟢 /status - Botun vəziyyəti və günlük limitlər\n"
-            "❓ /help - Bu menyu"
-        )
-
-    elif text in ["/status", "status"]:
-        stats = get_statistics()
-        with lock:
-            active_count = len(active_trades)
-        
-        cooldown_str = "Aktiv deyil"
-        if cooldown_until:
-            cooldown_str = cooldown_until.strftime("%d.%m.%Y %H:%M UTC")
-
-        reset_daily_counter_if_needed()
-
-        response_text = (
-            "🤖 *BOT VƏZİYYƏTİ*\n\n"
-            "🟢 Status: ONLINE\n"
-            f"📈 Açıq Trade Sayı: {active_count}\n"
-            f"📅 Bugünkü Trade Sayı: {daily_trade_count}/{MAX_TRADES_PER_DAY}\n"
-            f"❄️ Cooldown: {cooldown_str}"
-        )
-
-    elif text in ["/stats", "stats", "statistika"]:
-        stats = get_statistics()
-        response_text = (
-            "📊 *ÜMUMİ STATİSTİKA*\n\n"
-            f"Cəmi Trade: {stats['total']}\n"
-            f"✅ WIN: {stats['wins']}\n"
-            f"❌ LOSS: {stats['losses']}\n"
-            f"🎯 Win Rate: %{stats['win_rate']}"
-        )
-
-    elif text in ["/active", "active", "aciq"]:
-        with lock:
-            trades_list = list(active_trades.values())
-
-        if not trades_list:
-            response_text = "ℹ️ Hal-hazırda aktiv trade yoxdur."
-        else:
-            response_text = "⚡ *AÇIQ TRADELƏR*\n\n"
-            for t in trades_list:
-                emoji = "🟢" if t["side"] == "LONG" else "🔴"
-                response_text += (
-                    f"{emoji} *{t['symbol']} {t['side']}*\n"
-                    f"Entry: `{t['entry']:.4f}`\n"
-                    f"Trailing Stop: `{t['trailing_stop']:.4f}`\n"
-                    f"Həcm: ~`{t['position_size_usdt']:.2f}` USDT\n\n"
-                )
-
-    if response_text:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        try:
-            requests.post(
-                url,
-                json={"chat_id": chat_id, "text": response_text, "parse_mode": "Markdown"},
-                timeout=10
-            )
-        except Exception as e:
-            print("❌ Webhook mesaj göndərmə xətası:", e)
-
+    if data:
+        process_telegram_update(data)
     return jsonify({"status": "ok"}), 200
 
 
@@ -675,4 +760,4 @@ startup()
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port, use_reloader=False)
