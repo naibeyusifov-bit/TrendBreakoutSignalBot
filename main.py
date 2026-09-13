@@ -1,15 +1,23 @@
 """
-TREND BREAKOUT BOT (OPTIMIZED & TELEGRAM READY)
+TREND BREAKOUT BOT (OPTIMIZED & TELEGRAM READY) - FIXED
 ===============================================
 - TELEGRAM INTEGRATION: Həm Long Polling (getUpdates), həm də Webhook dəstəyi.
 - NO REPAINT           : İndikatorlar və breakout tam bağlanmış şamlar (-2) üzrə.
 - THREAD-SAFE          : Lock-lar ilə yaddaş və SQLite toqquşmasının qarşısı alınıb.
 - TEST READY           : Günlük trade limiti test üçün limitsizdir (99999).
+
+DÜZƏLİŞLƏR (bu versiyada):
+1. update_trailing_stops: race condition düzəldildi - bütün oxuma/yazma eyni lock daxilində
+2. fetch_klines / fetch_price: ardıcıl uğursuzluqlar sayılır, N dəfədən sonra Telegram xəbərdarlığı
+3. Startup mesajı: yalnız faktiki ilk başlanğıcda göndərilir (env dəyişəni ilə söndürülə bilər)
+4. PID lock faylı: proses bitəndə (normal çıxışda) təmizlənir
+5. atexit ilə səliyyəli bağlanma
 """
 
 import os
 import sys
 import time
+import atexit
 import sqlite3
 import threading
 from datetime import datetime, timezone
@@ -27,6 +35,9 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID_HERE")
 
 # Long Polling rejimini aktiv saxlayın (Webhook qurmağa ehtiyac qalmır)
 USE_POLLING = os.getenv("USE_POLLING", "True").lower() == "true"
+
+# Restart zamanı "BOT AKTİVDİR" mesajının göndərilib-göndərilməyəcəyi
+SEND_STARTUP_MESSAGE = os.getenv("SEND_STARTUP_MESSAGE", "True").lower() == "true"
 
 BYBIT_KLINE_URL = "https://api.bybit.com/v5/market/kline"
 BYBIT_TICKER_URL = "https://api.bybit.com/v5/market/tickers"
@@ -51,6 +62,19 @@ RISK_PER_TRADE_PCT = 0.01
 MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "99999"))
 MAX_CONSECUTIVE_LOSSES = 3
 COOLDOWN_HOURS_AFTER_LOSSES = 24
+
+# Neçə ardıcıl uğursuz API sorğusundan sonra Telegram-a xəbərdarlıq göndərilsin
+MAX_CONSECUTIVE_FETCH_FAILS = 5
+
+# ------------------------------------------------------------
+# SİQNAL PUANLAMASI (SCORING)
+# ------------------------------------------------------------
+# BTC bu qrupa daxil deyil - həmişə müstəqil işləyir (özəl filtr yoxdur).
+# ETH və SOL eyni vaxtda breakout versə, yalnız ən yüksək balı olan açılır.
+SCORE_GROUP_SYMBOLS = ["ETHUSDT", "SOLUSDT"]
+
+# 100 üzərindən minimum keçid balı - bundan aşağı olan siqnal (qrup daxilində) açılmır
+MIN_SIGNAL_SCORE = float(os.getenv("MIN_SIGNAL_SCORE", "50"))
 
 DB_FILE = "trend_breakout.db"
 PID_FILE = "trend_bot.lock"
@@ -82,8 +106,13 @@ daily_count_date = None
 consecutive_losses = 0
 cooldown_until = None
 
+# Ardıcıl fetch uğursuzluqlarının sayğacı (simvol -> say)
+fetch_fail_counts = {s: 0 for s in SYMBOLS}
+fetch_fail_alerted = {s: False for s in SYMBOLS}
+
 _startup_done = False
 _startup_lock = threading.Lock()
+_owns_pid_lock = False
 
 
 # ============================================================
@@ -92,6 +121,7 @@ _startup_lock = threading.Lock()
 
 def check_single_instance():
     """Botun dublikat işə düşməsinin qarşısını alır."""
+    global _owns_pid_lock
     pid = str(os.getpid())
     if os.path.exists(PID_FILE):
         try:
@@ -103,6 +133,7 @@ def check_single_instance():
                     print(f"⚠️ [PID Lock] Bot artıq başqa prosesdə işləyir (PID: {old_pid}). Təkrarlanma dayandırıldı.")
                     return False
                 except (OSError, ProcessLookupError):
+                    # köhnə prosess artıq yoxdur - stale lock, üzərinə yazırıq
                     pass
         except (OSError, ValueError):
             pass
@@ -110,10 +141,28 @@ def check_single_instance():
     try:
         with open(PID_FILE, "w") as f:
             f.write(pid)
+        _owns_pid_lock = True
         return True
     except Exception as e:
         print(f"❌ PID lock faylı xətası: {e}")
         return True
+
+
+def release_pid_lock():
+    """Proses normal bağlananda öz PID lock faylını təmizləyir."""
+    if not _owns_pid_lock:
+        return
+    try:
+        if os.path.exists(PID_FILE):
+            with open(PID_FILE, "r") as f:
+                saved_pid = f.read().strip()
+            if saved_pid == str(os.getpid()):
+                os.remove(PID_FILE)
+    except Exception as e:
+        print("⚠️ PID lock təmizləmə xətası:", e)
+
+
+atexit.register(release_pid_lock)
 
 
 # ============================================================
@@ -252,10 +301,11 @@ def process_telegram_update(update_data):
             active_count = len(active_trades)
             reset_daily_counter_if_needed()
             current_daily = daily_trade_count
+            current_cooldown = cooldown_until
 
         cooldown_str = "Aktiv deyil"
-        if cooldown_until:
-            cooldown_str = cooldown_until.strftime("%d.%m.%Y %H:%M UTC")
+        if current_cooldown:
+            cooldown_str = current_cooldown.strftime("%d.%m.%Y %H:%M UTC")
 
         limit_str = "Limitsiz (Test)" if MAX_TRADES_PER_DAY >= 9999 else str(MAX_TRADES_PER_DAY)
 
@@ -341,9 +391,11 @@ def fetch_klines(symbol, interval, limit=MAX_CANDLES):
         data = r.json()
         if data.get("retCode") != 0:
             print(f"❌ Bybit kline xətası {symbol}:", data)
+            _note_fetch_failure(symbol)
             return []
         rows = data["result"]["list"]
         rows.reverse()
+        _note_fetch_success(symbol)
         return [{
             "time": int(row[0]),
             "open": float(row[1]),
@@ -354,6 +406,7 @@ def fetch_klines(symbol, interval, limit=MAX_CANDLES):
         } for row in rows]
     except Exception as e:
         print(f"❌ {symbol} kline sorğu xətası:", e)
+        _note_fetch_failure(symbol)
         return []
 
 
@@ -363,14 +416,43 @@ def fetch_price(symbol):
         r = requests.get(BYBIT_TICKER_URL, params=params, timeout=10)
         data = r.json()
         if data.get("retCode") != 0:
+            _note_fetch_failure(symbol)
             return None
         lst = data["result"]["list"]
         if not lst:
+            _note_fetch_failure(symbol)
             return None
+        _note_fetch_success(symbol)
         return float(lst[0]["lastPrice"])
     except Exception as e:
         print(f"❌ {symbol} qiymət sorğu xətası:", e)
+        _note_fetch_failure(symbol)
         return None
+
+
+def _note_fetch_failure(symbol):
+    alert_needed = False
+    with lock:
+        fetch_fail_counts[symbol] += 1
+        if fetch_fail_counts[symbol] >= MAX_CONSECUTIVE_FETCH_FAILS and not fetch_fail_alerted[symbol]:
+            fetch_fail_alerted[symbol] = True
+            alert_needed = True
+    if alert_needed:
+        send_telegram(
+            f"⚠️ {symbol}: Bybit-dən {MAX_CONSECUTIVE_FETCH_FAILS} ardıcıl dəfə "
+            f"məlumat alına bilmədi. Şəbəkə/API problemi ola bilər."
+        )
+
+
+def _note_fetch_success(symbol):
+    was_alerted = False
+    with lock:
+        if fetch_fail_alerted[symbol]:
+            was_alerted = True
+        fetch_fail_counts[symbol] = 0
+        fetch_fail_alerted[symbol] = False
+    if was_alerted:
+        send_telegram(f"✅ {symbol}: Bybit bağlantısı bərpa olundu, məlumat axını normaldır.")
 
 
 # ============================================================
@@ -407,11 +489,102 @@ def donchian_channel(candles, period, exclude_last=1):
     return max(c["high"] for c in window), min(c["low"] for c in window)
 
 
+def calc_adx(candles, period=14):
+    """
+    Wilder's ADX - trendin GÜCÜNÜ ölçür (istiqamət deyil).
+    0-20  : zəif/yastı bazar (breakout-lar çox vaxt yalançı çıxır)
+    20-40 : orta/güclü trend
+    40+   : çox güclü trend
+    """
+    if len(candles) < period * 2 + 1:
+        return None
+
+    plus_dm, minus_dm, trs = [], [], []
+    for i in range(1, len(candles)):
+        up_move = candles[i]["high"] - candles[i - 1]["high"]
+        down_move = candles[i - 1]["low"] - candles[i]["low"]
+        plus_dm.append(up_move if (up_move > down_move and up_move > 0) else 0)
+        minus_dm.append(down_move if (down_move > up_move and down_move > 0) else 0)
+        h, l, pc = candles[i]["high"], candles[i]["low"], candles[i - 1]["close"]
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+
+    def wilder_smooth(values, period):
+        if len(values) < period:
+            return []
+        smoothed = [sum(values[:period])]
+        for v in values[period:]:
+            smoothed.append(smoothed[-1] - (smoothed[-1] / period) + v)
+        return smoothed
+
+    tr_smooth = wilder_smooth(trs, period)
+    plus_smooth = wilder_smooth(plus_dm, period)
+    minus_smooth = wilder_smooth(minus_dm, period)
+
+    if not tr_smooth or not plus_smooth or not minus_smooth:
+        return None
+
+    n = min(len(tr_smooth), len(plus_smooth), len(minus_smooth))
+    dx = []
+    for i in range(n):
+        t = tr_smooth[i]
+        if t == 0:
+            dx.append(0)
+            continue
+        p_di = 100 * (plus_smooth[i] / t)
+        m_di = 100 * (minus_smooth[i] / t)
+        denom = p_di + m_di
+        dx.append(100 * abs(p_di - m_di) / denom if denom else 0)
+
+    if len(dx) < period:
+        return None
+
+    adx_val = sum(dx[:period]) / period
+    for d in dx[period:]:
+        adx_val = (adx_val * (period - 1) + d) / period
+    return adx_val
+
+
+def calculate_signal_score(side, entry, donchian_high, donchian_low, current_atr,
+                            adx_value, breakout_volume, avg_volume):
+    """
+    Siqnalı 0-100 arası balla qiymətləndirir. 3 komponentdən ibarətdir:
+      - ADX (trend gücü)          : max 40 xal
+      - Breakout məsafəsi (ATR-ə görə) : max 30 xal
+      - Həcm təsdiqi (ortalamaya nisbət): max 30 xal
+    """
+    adx_value = adx_value or 0
+    score_adx = min(adx_value / 40.0, 1.0) * 40
+
+    if current_atr and current_atr > 0:
+        if side == "LONG":
+            breakout_distance = max((entry - donchian_high) / current_atr, 0)
+        else:
+            breakout_distance = max((donchian_low - entry) / current_atr, 0)
+    else:
+        breakout_distance = 0
+    score_breakout = min(breakout_distance / 1.0, 1.0) * 30
+
+    if avg_volume and avg_volume > 0:
+        volume_ratio = breakout_volume / avg_volume
+    else:
+        volume_ratio = 1.0
+    score_volume = min(volume_ratio / 2.0, 1.0) * 30
+
+    total = round(score_adx + score_breakout + score_volume, 1)
+    breakdown = {
+        "adx": round(score_adx, 1),
+        "breakout": round(score_breakout, 1),
+        "volume": round(score_volume, 1),
+    }
+    return total, breakdown
+
+
 # ============================================================
 # RİSK İDARƏETMƏSİ
 # ============================================================
 
 def reset_daily_counter_if_needed():
+    """DİQQƏT: yalnız `lock` artıq tutulmuş halda çağırılmalıdır."""
     global daily_trade_count, daily_count_date
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if daily_count_date != today:
@@ -420,6 +593,7 @@ def reset_daily_counter_if_needed():
 
 
 def risk_checks_pass():
+    """DİQQƏT: yalnız `lock` artıq tutulmuş halda çağırılmalıdır."""
     reset_daily_counter_if_needed()
     if cooldown_until is not None:
         if datetime.now(timezone.utc) < cooldown_until:
@@ -430,23 +604,24 @@ def risk_checks_pass():
 
 
 def register_trade_opened():
+    """DİQQƏT: yalnız `lock` artıq tutulmuş halda çağırılmalıdır."""
     global daily_trade_count
     daily_trade_count += 1
 
 
 def register_trade_result(result):
+    """DİQQƏT: yalnız `lock` artıq tutulmuş halda çağırılmalıdır. Telegram göndərişi lock xaricində edilir."""
     global consecutive_losses, cooldown_until
+    should_alert_cooldown = False
     if result == "LOSS":
         consecutive_losses += 1
         if consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
             cooldown_until_ts = datetime.now(timezone.utc).timestamp() + COOLDOWN_HOURS_AFTER_LOSSES * 3600
             cooldown_until = datetime.fromtimestamp(cooldown_until_ts, tz=timezone.utc)
-            send_telegram(
-                f"⏸️ {MAX_CONSECUTIVE_LOSSES} ardıcıl itkidən sonra bot "
-                f"{COOLDOWN_HOURS_AFTER_LOSSES} saat dayandırılır."
-            )
+            should_alert_cooldown = True
     else:
         consecutive_losses = 0
+    return should_alert_cooldown
 
 
 def calc_position_size(entry, stop):
@@ -495,15 +670,26 @@ def check_for_signal(symbol):
     breakout_long = closed_trade_candle["close"] > donchian_high
     breakout_short = closed_trade_candle["close"] < donchian_low
 
+    # Bal hesablamaq üçün: ADX (trend gücü) və orta həcm (son 20 bağlanmış şam,
+    # breakout şamı XARİC olmaqla - repaint riski olmasın deyə)
+    adx_value = calc_adx(trade_data[:-1], ATR_PERIOD)
+    volume_window = trade_data[:-2][-20:]
+    avg_volume = (sum(c["volume"] for c in volume_window) / len(volume_window)) if volume_window else None
+    breakout_volume = closed_trade_candle["volume"]
+
     if bullish_regime and breakout_long:
         entry = closed_trade_candle["close"]
         initial_stop = entry - current_atr * CHANDELIER_ATR_MULT
         if initial_stop >= entry:
             return None
+        score, breakdown = calculate_signal_score(
+            "LONG", entry, donchian_high, donchian_low, current_atr,
+            adx_value, breakout_volume, avg_volume
+        )
         return {
             "symbol": symbol, "side": "LONG", "entry": entry,
             "initial_stop": initial_stop, "candle_time": closed_trade_candle["time"],
-            "atr": current_atr,
+            "atr": current_atr, "score": score, "score_breakdown": breakdown,
         }
 
     if bearish_regime and breakout_short:
@@ -511,10 +697,14 @@ def check_for_signal(symbol):
         initial_stop = entry + current_atr * CHANDELIER_ATR_MULT
         if initial_stop <= entry:
             return None
+        score, breakdown = calculate_signal_score(
+            "SHORT", entry, donchian_high, donchian_low, current_atr,
+            adx_value, breakout_volume, avg_volume
+        )
         return {
             "symbol": symbol, "side": "SHORT", "entry": entry,
             "initial_stop": initial_stop, "candle_time": closed_trade_candle["time"],
-            "atr": current_atr,
+            "atr": current_atr, "score": score, "score_breakdown": breakdown,
         }
 
     return None
@@ -522,6 +712,7 @@ def check_for_signal(symbol):
 
 def open_trade(signal):
     symbol = signal["symbol"]
+    trade = None
 
     with lock:
         if symbol in active_trades:
@@ -551,9 +742,24 @@ def open_trade(signal):
         }
         active_trades[symbol] = trade
         register_trade_opened()
+        current_daily_count = daily_trade_count
+
+    if trade is None:
+        return
 
     emoji = "🟢" if trade["side"] == "LONG" else "🔴"
     limit_str = "Limitsiz (Test)" if MAX_TRADES_PER_DAY >= 9999 else str(MAX_TRADES_PER_DAY)
+
+    score = signal.get("score")
+    breakdown = signal.get("score_breakdown") or {}
+    score_line = ""
+    if score is not None:
+        score_line = (
+            f"\n🎯 Siqnal Balı: {score}/100 "
+            f"(ADX:{breakdown.get('adx','-')} | Breakout:{breakdown.get('breakout','-')} | "
+            f"Həcm:{breakdown.get('volume','-')})\n"
+        )
+
     message = f"""
 🚨 TREND BREAKOUT SİQNALI (TEST REJİMİ)
 
@@ -562,63 +768,76 @@ def open_trade(signal):
 Entry: {trade["entry"]:.4f}
 İlkin Stop: {trade["initial_stop"]:.4f}
 Tövsiyə olunan pozisiya: ~{trade["position_size_usdt"]:.2f} USDT
-
+{score_line}
 Səbəb: Donchian({DONCHIAN_PERIOD}) breakout + EMA{EMA_TREND_PERIOD}({TREND_TF}dəq) trend
 
 ⏳ Status: ACTIVE — Trailing Stop Aktivdir
-📅 Günlük Trade Sayı: {daily_trade_count}/{limit_str}
+📅 Günlük Trade Sayı: {current_daily_count}/{limit_str}
 """
     print(message)
     send_telegram(message)
 
 
 def update_trailing_stops(symbol, price):
+    """
+    DÜZƏLİŞ: Əvvəlki versiyada trade dict-i lock daxilində götürülüb,
+    lock XARİCİNDƏ dəyişdirilirdi (extreme_price, trailing_stop) - bu,
+    price_worker və başqa thread-lər eyni anda toxunanda data corruption-a
+    səbəb ola bilərdi. İndi bütün oxuma+yazma eyni lock bloku daxilindədir.
+    """
+    trade_snapshot = None
+    should_alert_cooldown = False
+
     with lock:
         trade = active_trades.get(symbol)
         if not trade:
             return
 
-    result = None
+        result = None
 
-    if trade["side"] == "LONG":
-        if price > trade["extreme_price"]:
-            trade["extreme_price"] = price
-            new_stop = trade["extreme_price"] - trade["atr"] * CHANDELIER_ATR_MULT
-            if new_stop > trade["trailing_stop"]:
-                trade["trailing_stop"] = new_stop
-        if price <= trade["trailing_stop"]:
-            result = "WIN" if trade["trailing_stop"] > trade["entry"] else "LOSS"
-    else:
-        if price < trade["extreme_price"]:
-            trade["extreme_price"] = price
-            new_stop = trade["extreme_price"] + trade["atr"] * CHANDELIER_ATR_MULT
-            if new_stop < trade["trailing_stop"]:
-                trade["trailing_stop"] = new_stop
-        if price >= trade["trailing_stop"]:
-            result = "WIN" if trade["trailing_stop"] < trade["entry"] else "LOSS"
+        if trade["side"] == "LONG":
+            if price > trade["extreme_price"]:
+                trade["extreme_price"] = price
+                new_stop = trade["extreme_price"] - trade["atr"] * CHANDELIER_ATR_MULT
+                if new_stop > trade["trailing_stop"]:
+                    trade["trailing_stop"] = new_stop
+            if price <= trade["trailing_stop"]:
+                result = "WIN" if trade["trailing_stop"] > trade["entry"] else "LOSS"
+        else:
+            if price < trade["extreme_price"]:
+                trade["extreme_price"] = price
+                new_stop = trade["extreme_price"] + trade["atr"] * CHANDELIER_ATR_MULT
+                if new_stop < trade["trailing_stop"]:
+                    trade["trailing_stop"] = new_stop
+            if price >= trade["trailing_stop"]:
+                result = "WIN" if trade["trailing_stop"] < trade["entry"] else "LOSS"
 
-    if result is None:
-        return
+        if result is None:
+            return
 
-    trade["status"] = result
-    trade["exit_price"] = price
-    trade["closed_at"] = time.time()
+        trade["status"] = result
+        trade["exit_price"] = price
+        trade["closed_at"] = time.time()
 
-    with lock:
         active_trades.pop(symbol, None)
-        register_trade_result(result)
+        should_alert_cooldown = register_trade_result(result)
 
-    save_trade(trade)
+        # Telegram/DB üçün lock xaricinə çıxaracağımız dəyişməz snapshot
+        trade_snapshot = dict(trade)
 
-    emoji = "✅" if result == "WIN" else "❌"
+    # Bundan sonrakı hər şey lock XARİCİNDƏ - şəbəkə/DB çağırışları lock-u
+    # gərək saxlamasın, əks halda digər thread-lər bloklanar
+    save_trade(trade_snapshot)
+
+    emoji = "✅" if trade_snapshot["status"] == "WIN" else "❌"
     message = f"""
-{emoji} TRADE BAĞLANDI — {result}
+{emoji} TRADE BAĞLANDI — {trade_snapshot["status"]}
 
-{trade["symbol"]} {trade["side"]}
-Entry: {trade["entry"]:.4f}
-Exit (trailing stop): {trade["exit_price"]:.4f}
+{trade_snapshot["symbol"]} {trade_snapshot["side"]}
+Entry: {trade_snapshot["entry"]:.4f}
+Exit (trailing stop): {trade_snapshot["exit_price"]:.4f}
 
-RESULT: {result}
+RESULT: {trade_snapshot["status"]}
 """
     send_telegram(message)
 
@@ -629,15 +848,59 @@ RESULT: {result}
         f"Win Rate: {stats['win_rate']}%"
     )
 
+    if should_alert_cooldown:
+        send_telegram(
+            f"⏸️ {MAX_CONSECUTIVE_LOSSES} ardıcıl itkidən sonra bot "
+            f"{COOLDOWN_HOURS_AFTER_LOSSES} saat dayandırılır."
+        )
+
 
 # ============================================================
 # POLLING WORKERS
 # ============================================================
 
+def process_pending_signals(pending_signals):
+    """
+    BTC (SCORE_GROUP_SYMBOLS-ə daxil deyil) hər zaman müstəqil açılır.
+    ETH və SOL eyni dövrdə (eyni pass-da) breakout versə, yalnız ən yüksək
+    balı olan (MIN_SIGNAL_SCORE həddini keçən) açılır - digəri ötürülür.
+    """
+    if not pending_signals:
+        return
+
+    # Qrupa daxil olmayan simvollar (BTC) - filtr olmadan açılır
+    for symbol, signal in pending_signals.items():
+        if symbol not in SCORE_GROUP_SYMBOLS:
+            open_trade(signal)
+
+    group_signals = {s: sig for s, sig in pending_signals.items() if s in SCORE_GROUP_SYMBOLS}
+    if not group_signals:
+        return
+
+    best_symbol, best_signal = max(group_signals.items(), key=lambda kv: kv[1].get("score", 0))
+
+    for symbol, signal in group_signals.items():
+        score = signal.get("score", 0)
+        if symbol == best_symbol:
+            if score >= MIN_SIGNAL_SCORE:
+                open_trade(signal)
+            else:
+                print(f"⏸️ {symbol} ən yüksək bal idi ({score}/100) amma minimum həddi ({MIN_SIGNAL_SCORE}) keçmədi.")
+        else:
+            print(f"⏭️ {symbol} siqnalı ötürüldü — {best_symbol} daha yüksək bal aldı.")
+            send_telegram(
+                f"⏭️ {symbol} breakout siqnalı var idi (bal: {score}/100), "
+                f"lakin {best_symbol} daha yüksək bal aldığı üçün (bal: {best_signal.get('score', 0)}/100) "
+                f"yalnız {best_symbol} açıldı."
+            )
+
+
 def candle_worker():
     last_seen_time = {s: None for s in SYMBOLS}
 
     while True:
+        pending_signals = {}
+
         for symbol in SYMBOLS:
             trade_candles = fetch_klines(symbol, TRADE_TF)
             trend_candles = fetch_klines(symbol, TREND_TF)
@@ -655,9 +918,11 @@ def candle_worker():
                     last_seen_time[symbol] = closed_time
                     signal = check_for_signal(symbol)
                     if signal:
-                        open_trade(signal)
+                        pending_signals[symbol] = signal
 
             time.sleep(1)
+
+        process_pending_signals(pending_signals)
 
         time.sleep(CANDLE_POLL_SECONDS)
 
@@ -696,15 +961,16 @@ def startup():
     if USE_POLLING:
         threading.Thread(target=telegram_polling_worker, daemon=True).start()
 
-    limit_str = "Limitsiz (Test)" if MAX_TRADES_PER_DAY >= 9999 else str(MAX_TRADES_PER_DAY)
-    send_telegram(
-        "🚀 TREND BREAKOUT BOT AKTİVDİR!\n\n"
-        f"📡 {', '.join(SYMBOLS)} izlənilir.\n"
-        f"📊 Donchian({DONCHIAN_PERIOD}) + EMA{EMA_TREND_PERIOD}({TREND_TF}dəq) + Chandelier Exit\n"
-        f"⚖️ Günlük Max Trade: {limit_str}\n"
-        "💾 Nəticələr SQLite-də saxlanılır.\n\n"
-        "💬 Bot əmrləri üçün Telegram-da /help yazın."
-    )
+    if SEND_STARTUP_MESSAGE:
+        limit_str = "Limitsiz (Test)" if MAX_TRADES_PER_DAY >= 9999 else str(MAX_TRADES_PER_DAY)
+        send_telegram(
+            "🚀 TREND BREAKOUT BOT AKTİVDİR!\n\n"
+            f"📡 {', '.join(SYMBOLS)} izlənilir.\n"
+            f"📊 Donchian({DONCHIAN_PERIOD}) + EMA{EMA_TREND_PERIOD}({TREND_TF}dəq) + Chandelier Exit\n"
+            f"⚖️ Günlük Max Trade: {limit_str}\n"
+            "💾 Nəticələr SQLite-də saxlanılır.\n\n"
+            "💬 Bot əmrləri üçün Telegram-da /help yazın."
+        )
 
 
 # ============================================================
@@ -716,6 +982,7 @@ def home():
     stats = get_statistics()
     with lock:
         active_count = len(active_trades)
+        cooldown_snapshot = cooldown_until
     return jsonify({
         "status": "online",
         "mode": "SIGNAL-ONLY (real sifariş yoxdur)",
@@ -724,7 +991,7 @@ def home():
         "trend_tf": TREND_TF,
         "active_trades": active_count,
         "statistics": stats,
-        "cooldown_until": cooldown_until.isoformat() if cooldown_until else None,
+        "cooldown_until": cooldown_snapshot.isoformat() if cooldown_snapshot else None,
     })
 
 
