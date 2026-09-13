@@ -5,21 +5,14 @@ SMC/liquidity-sweep əvəzinə obyektiv, backtest edilə bilən qaydalar:
 
   - TREND FILTRİ : yüksək timeframe-də (default 1h) EMA200-ə görə istiqamət
   - GİRİŞ        : Donchian Channel breakout (son N bağlanmış şamın ən
-                   yüksək/aşağı səviyyəsinin qırılması) — subyektiv "BOS"
-                   yerinə, ədədi və birmənalı qayda
-  - ÇIXIŞ        : Chandelier Exit — ATR-based trailing stop. Sabit RR
-                   yerinə qazancın "qaçmasına" imkan verir, itkini isə
-                   sərt məhdudlaşdırır
+                   yüksək/aşağı səviyyəsinin qırılması)
+  - ÇIXIŞ        : Chandelier Exit — ATR-based trailing stop.
   - RİSK         : Fixed-fractional pozisiya ölçüsü, günlük trade limiti,
-                   ardıcıl itkidən sonra soyuma (cooldown) — bunlar əlavə
-                   yox, botun nüvəsidir
+                   ardıcıl itkidən sonra soyuma (cooldown)
 
-QEYD: Bu bot REAL SİFARİŞ VERMİR — yalnız siqnal göndərir və virtual
-(kağız) trade-i qiymət hərəkətinə görə izləyib nəticəni (WIN/LOSS)
-Telegram-a bildirir + SQLite-ə yazır.
-
-Bu, maliyyə məsləhəti deyil. Strategiyanın özü bura yazılmazdan əvvəl
-tarixi datada backtest edilməyib.
+TELEGRAM İNTEQRASİYASI:
+  - Avtomatik siqnal və bildirişlər
+  - Webhook vasitəsilə cavab verən komandalar (/status, /stats, /active, /help)
 """
 
 import os
@@ -29,7 +22,7 @@ import threading
 from datetime import datetime, timezone
 
 import requests
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 
 
 # ============================================================
@@ -99,7 +92,7 @@ _startup_lock = threading.Lock()
 # ============================================================
 
 def init_db():
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=10)
     cur = conn.cursor()
     cur.execute("""
         CREATE TABLE IF NOT EXISTS trades (
@@ -121,7 +114,7 @@ def init_db():
 
 def save_trade(trade):
     try:
-        conn = sqlite3.connect(DB_FILE)
+        conn = sqlite3.connect(DB_FILE, timeout=10)
         cur = conn.cursor()
         cur.execute("""
             INSERT INTO trades
@@ -142,7 +135,7 @@ def save_trade(trade):
 
 def get_statistics():
     init_db()
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=10)
     cur = conn.cursor()
     cur.execute("""
         SELECT COUNT(*),
@@ -163,13 +156,16 @@ init_db()
 # TELEGRAM
 # ============================================================
 
-def send_telegram(message):
+def send_telegram(message, parse_mode=None):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("❌ Telegram token/chat_id yoxdur.")
         return False
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
     try:
-        r = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": message}, timeout=10)
+        r = requests.post(url, json=payload, timeout=10)
         ok = r.json().get("ok")
         if not ok:
             print("❌ Telegram xətası:", r.json())
@@ -545,12 +541,12 @@ def startup():
         f"⚖️ Risk: trade başına balansın {RISK_PER_TRADE_PCT*100:.0f}%-i, "
         f"günlük max {MAX_TRADES_PER_DAY} trade\n"
         "💾 Nəticələr SQLite-də saxlanılır.\n\n"
-        "⚠️ Bu bot REAL SİFARİŞ VERMİR — yalnız siqnal göndərir."
+        "💬 Bot əmrləri üçün Telegram-da /help yazın."
     )
 
 
 # ============================================================
-# ROUTES
+# ROUTES & WEBHOOK
 # ============================================================
 
 @app.route("/")
@@ -584,6 +580,91 @@ def stats_route():
 def active_route():
     with lock:
         return jsonify(list(active_trades.values()))
+
+
+@app.route("/telegram-webhook", methods=["POST"])
+def telegram_webhook():
+    """Telegram-dan gələn mesajları dinləyən və cavablandıran yer."""
+    data = request.get_json()
+    if not data or "message" not in data:
+        return jsonify({"status": "ignored"}), 200
+
+    message = data["message"]
+    chat_id = message.get("chat", {}).get("id")
+    text = message.get("text", "").strip().lower()
+
+    if not chat_id:
+        return jsonify({"status": "no chat_id"}), 200
+
+    response_text = ""
+
+    if text in ["/start", "/help", "komek", "kömək", "yardim", "yardım"]:
+        response_text = (
+            "🤖 *TREND BREAKOUT BOT ƏMRLƏRİ*\n\n"
+            "📊 /stats - Ümumi WIN/LOSS və Win Rate\n"
+            "⚡ /active - Açıq olan pozisiyalar\n"
+            "🟢 /status - Botun vəziyyəti və günlük limitlər\n"
+            "❓ /help - Bu menyu"
+        )
+
+    elif text in ["/status", "status"]:
+        stats = get_statistics()
+        with lock:
+            active_count = len(active_trades)
+        
+        cooldown_str = "Aktiv deyil"
+        if cooldown_until:
+            cooldown_str = cooldown_until.strftime("%d.%m.%Y %H:%M UTC")
+
+        reset_daily_counter_if_needed()
+
+        response_text = (
+            "🤖 *BOT VƏZİYYƏTİ*\n\n"
+            "🟢 Status: ONLINE\n"
+            f"📈 Açıq Trade Sayı: {active_count}\n"
+            f"📅 Bugünkü Trade Sayı: {daily_trade_count}/{MAX_TRADES_PER_DAY}\n"
+            f"❄️ Cooldown: {cooldown_str}"
+        )
+
+    elif text in ["/stats", "stats", "statistika"]:
+        stats = get_statistics()
+        response_text = (
+            "📊 *ÜMUMİ STATİSTİKA*\n\n"
+            f"Cəmi Trade: {stats['total']}\n"
+            f"✅ WIN: {stats['wins']}\n"
+            f"❌ LOSS: {stats['losses']}\n"
+            f"🎯 Win Rate: %{stats['win_rate']}"
+        )
+
+    elif text in ["/active", "active", "aciq"]:
+        with lock:
+            trades_list = list(active_trades.values())
+
+        if not trades_list:
+            response_text = "ℹ️ Hal-hazırda aktiv trade yoxdur."
+        else:
+            response_text = "⚡ *AÇIQ TRADELƏR*\n\n"
+            for t in trades_list:
+                emoji = "🟢" if t["side"] == "LONG" else "🔴"
+                response_text += (
+                    f"{emoji} *{t['symbol']} {t['side']}*\n"
+                    f"Entry: `{t['entry']:.4f}`\n"
+                    f"Trailing Stop: `{t['trailing_stop']:.4f}`\n"
+                    f"Həcm: ~`{t['position_size_usdt']:.2f}` USDT\n\n"
+                )
+
+    if response_text:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        try:
+            requests.post(
+                url,
+                json={"chat_id": chat_id, "text": response_text, "parse_mode": "Markdown"},
+                timeout=10
+            )
+        except Exception as e:
+            print("❌ Webhook mesaj göndərmə xətası:", e)
+
+    return jsonify({"status": "ok"}), 200
 
 
 # ============================================================
