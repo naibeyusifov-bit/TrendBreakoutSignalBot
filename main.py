@@ -791,10 +791,13 @@ def check_for_signal(symbol, tf):
         side, entry, donchian_high, donchian_low, current_atr,
         adx_value, breakout_volume, avg_volume
     )
+    r_value = abs(entry - initial_stop)
+    tp_price = entry + r_value * PARTIAL_TP_R_MULTIPLE if side == "LONG" else entry - r_value * PARTIAL_TP_R_MULTIPLE
     return {
         "symbol": symbol, "tf": tf, "side": side, "entry": entry,
         "initial_stop": initial_stop, "candle_time": closed_candle["time"],
         "atr": current_atr, "score": score, "score_breakdown": breakdown,
+        "tp_price": tp_price,
     }
 
 
@@ -870,6 +873,7 @@ def open_trade(signal):
 
 Entry: {trade["entry"]:.4f}
 İlkin Stop: {trade["initial_stop"]:.4f}
+TP ({PARTIAL_TP_R_MULTIPLE}R): {signal.get("tp_price", 0):.4f}
 Tövsiyə olunan pozisiya: ~{trade["position_size_usdt"]:.2f} USDT
 {score_line}
 Səbəb: Donchian({DONCHIAN_PERIOD}) breakout + EMA{EMA_TREND_PERIOD} trend ({tf} timeframe-də)
