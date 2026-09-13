@@ -17,6 +17,15 @@ DƏYİŞİKLİKLƏR (bu versiyada, Bybit -> OKX keçidi):
    müstəqildir - əvəzinə hər TF öz ADX/Volume/ATR filtrini tətbiq edir.
 5. Telegram mesajlarında və /active əmrində timeframe də göstərilir.
 
+DÜZƏLİŞ (bu versiyada, 1Hutc/4Hutc -> 1H/4H):
+OKX API-də 'utc' sonluqlu bar dəyərləri (6Hutc, 12Hutc, 1Dutc və s.) YALNIZ
+6 saat və daha böyük timeframe-lər üçün mövcuddur. 1H və 4H üçün belə bir
+UTC variantı ümumiyyətlə yoxdur (saat sərhədi Hong Kong vaxtı ilə UTC
+arasında dəyişmir, yalnız gün və daha böyük vahidlərdə fərq yaranır).
+Ona görə "1Hutc"/"4Hutc" OKX tərəfindən etibarsız parametr kimi rədd
+edilirdi və hər dəfə "5 ardıcıl dəfə məlumat alına bilmədi" xətası verirdi.
+Düzəliş: TIMEFRAMES = ["5m", "15m", "1H", "4H"]
+
 QALAN HİSSƏLƏR (thread-safety, PID lock, partial TP, trailing stop,
 cooldown, DB) əvvəlki versiya ilə eynidir.
 """
@@ -58,10 +67,10 @@ OKX_PROXIES = {"http": OKX_PROXY_URL, "https": OKX_PROXY_URL} if OKX_PROXY_URL e
 SYMBOLS = ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"]
 
 # Hər TF müstəqil izlənilir. OKX 'bar' formatı: 5m, 15m, 1H, 4H
-# NOT: 1H/4H üçün 'utc' variantı (1Hutc/4Hutc) UTC saat sərhədlərinə
-# görə bağlanır (standart 1H/4H Honq-Konq vaxtına görədir). UTC-ə uyğun
-# davamlılıq üçün utc variantları seçildi.
-TIMEFRAMES = ["5m", "15m", "1Hutc", "4Hutc"]
+# NOT: OKX-də 'utc' sonluqlu bar dəyərləri (məs. 6Hutc, 12Hutc, 1Dutc)
+# YALNIZ 6 saat və daha böyük timeframe-lər üçün mövcuddur. 1H/4H üçün
+# UTC variantı YOXDUR - ona görə sadə "1H" və "4H" istifadə olunur.
+TIMEFRAMES = ["5m", "15m", "1H", "4H"]
 
 # Hər TF üçün nə qədər tez-tez şam yoxlanılsın (saniyə). Kiçik TF-lər daha
 # tez-tez, böyük TF-lər daha seyrək yoxlanıla bilər - burada sadəlik üçün
