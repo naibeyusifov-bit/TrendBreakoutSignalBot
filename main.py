@@ -26,8 +26,14 @@ Ona görə "1Hutc"/"4Hutc" OKX tərəfindən etibarsız parametr kimi rədd
 edilirdi və hər dəfə "5 ardıcıl dəfə məlumat alına bilmədi" xətası verirdi.
 Düzəliş: TIMEFRAMES = ["5m", "15m", "1H", "4H"]
 
+DƏYİŞİKLİK (bu versiyada): "3 ardıcıl itkidən sonra 24 saat dayanma"
+(cooldown) funksiyası TAMAMİLƏ LƏĞV EDİLDİ. Artıq bot neçə ardıcıl LOSS
+olursa olsun, dayanmır - risk yoxlamasında yalnız günlük trade limiti
+(MAX_TRADES_PER_DAY) qalıb. consecutive_losses / cooldown_until dəyişənləri
+və onlarla bağlı bütün Telegram bildirişləri götürülüb.
+
 QALAN HİSSƏLƏR (thread-safety, PID lock, partial TP, trailing stop,
-cooldown, DB) əvvəlki versiya ilə eynidir.
+DB) əvvəlki versiya ilə eynidir.
 """
 
 import os
@@ -89,8 +95,6 @@ ACCOUNT_BALANCE_USDT = float(os.getenv("ACCOUNT_BALANCE_USDT", "1000"))
 RISK_PER_TRADE_PCT = 0.01
 
 MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "99999"))
-MAX_CONSECUTIVE_LOSSES = 3
-COOLDOWN_HOURS_AFTER_LOSSES = 24
 
 MAX_CONSECUTIVE_FETCH_FAILS = 5
 
@@ -155,9 +159,6 @@ last_signal_candle = {s: {tf: None for tf in TIMEFRAMES} for s in SYMBOLS}
 
 daily_trade_count = 0
 daily_count_date = None
-
-consecutive_losses = 0
-cooldown_until = None
 
 # fetch_fail_counts[symbol][tf]
 fetch_fail_counts = {s: {tf: 0 for tf in TIMEFRAMES} for s in SYMBOLS}
@@ -360,11 +361,6 @@ def process_telegram_update(update_data):
             active_count = len(active_trades)
             reset_daily_counter_if_needed()
             current_daily = daily_trade_count
-            current_cooldown = cooldown_until
-
-        cooldown_str = "Aktiv deyil"
-        if current_cooldown:
-            cooldown_str = current_cooldown.strftime("%d.%m.%Y %H:%M UTC")
 
         limit_str = "Limitsiz (Test)" if MAX_TRADES_PER_DAY >= 9999 else str(MAX_TRADES_PER_DAY)
 
@@ -373,8 +369,7 @@ def process_telegram_update(update_data):
             "🟢 Status: ONLINE (OKX)\n"
             f"📡 TF-lər: {', '.join(TIMEFRAMES)}\n"
             f"📈 Açıq Trade Sayı: {active_count}\n"
-            f"📅 Bugünkü Trade Sayı: {current_daily}/{limit_str}\n"
-            f"❄️ Cooldown: {cooldown_str}"
+            f"📅 Bugünkü Trade Sayı: {current_daily}/{limit_str}"
         )
 
     elif cmd in ["/stats", "stats", "statistika"]:
@@ -657,7 +652,9 @@ def calculate_signal_score(side, entry, donchian_high, donchian_low, current_atr
 
 
 # ============================================================
-# RİSK İDARƏETMƏSİ (dəyişməyib)
+# RİSK İDARƏETMƏSİ
+# (3 ardıcıl itkidən sonra 24 saat cooldown ləğv edilib - yalnız
+#  günlük trade limiti qalıb)
 # ============================================================
 
 def reset_daily_counter_if_needed():
@@ -670,9 +667,6 @@ def reset_daily_counter_if_needed():
 
 def risk_checks_pass():
     reset_daily_counter_if_needed()
-    if cooldown_until is not None:
-        if datetime.now(timezone.utc) < cooldown_until:
-            return False, f"Cooldown aktivdir, {cooldown_until.isoformat()} tarixinə qədər"
     if daily_trade_count >= MAX_TRADES_PER_DAY:
         return False, "Günlük trade limiti dolub"
     return True, ""
@@ -684,17 +678,10 @@ def register_trade_opened():
 
 
 def register_trade_result(result):
-    global consecutive_losses, cooldown_until
-    should_alert_cooldown = False
-    if result == "LOSS":
-        consecutive_losses += 1
-        if consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
-            cooldown_until_ts = datetime.now(timezone.utc).timestamp() + COOLDOWN_HOURS_AFTER_LOSSES * 3600
-            cooldown_until = datetime.fromtimestamp(cooldown_until_ts, tz=timezone.utc)
-            should_alert_cooldown = True
-    else:
-        consecutive_losses = 0
-    return should_alert_cooldown
+    # Cooldown ləğv edilib - artıq nəticədən asılı olmayaraq heç bir
+    # dayandırma tətbiq edilmir. Funksiya yalnız çağırış zəncirini
+    # pozmamaq üçün saxlanılıb.
+    return False
 
 
 def calc_position_size(entry, stop):
@@ -887,7 +874,6 @@ Səbəb: Donchian({DONCHIAN_PERIOD}) breakout + EMA{EMA_TREND_PERIOD} trend ({tf
 
 def update_trailing_stops(key, price):
     trade_snapshot = None
-    should_alert_cooldown = False
     partial_tp_hit = None
 
     with lock:
@@ -936,7 +922,7 @@ def update_trailing_stops(key, price):
             trade["closed_at"] = time.time()
 
             active_trades.pop(key, None)
-            should_alert_cooldown = register_trade_result(result)
+            register_trade_result(result)
             trade_snapshot = dict(trade)
 
     if partial_tp_hit is not None:
@@ -973,12 +959,6 @@ RESULT: {trade_snapshot["status"]}
         f"WIN: {stats['wins']} | LOSS: {stats['losses']} | "
         f"Win Rate: {stats['win_rate']}%"
     )
-
-    if should_alert_cooldown:
-        send_telegram(
-            f"⏸️ {MAX_CONSECUTIVE_LOSSES} ardıcıl itkidən sonra bot "
-            f"{COOLDOWN_HOURS_AFTER_LOSSES} saat dayandırılır."
-        )
 
 
 # ============================================================
@@ -1118,7 +1098,6 @@ def home():
     stats = get_statistics()
     with lock:
         active_count = len(active_trades)
-        cooldown_snapshot = cooldown_until
     return jsonify({
         "status": "online",
         "exchange": "OKX",
@@ -1127,7 +1106,6 @@ def home():
         "timeframes": TIMEFRAMES,
         "active_trades": active_count,
         "statistics": stats,
-        "cooldown_until": cooldown_snapshot.isoformat() if cooldown_snapshot else None,
     })
 
 
